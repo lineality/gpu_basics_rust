@@ -79,44 +79,162 @@ use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 use std::collections::HashMap;
 
-/// Represents a batch of text data prepared for GPU processing
+/// Represents a batch of text data that has been vectorized and prepared for GPU processing.
+/// This structure serves as the intermediate format between raw text data and GPU computation.
 #[derive(Debug)]
 struct TextBatch {
-    /// The vectorized data ready for GPU
+    /// The vectorized data ready for GPU processing.
+    /// Each inner Vec<f32> represents one row of transformed text data.
+    /// All inner vectors must have the same length (vector_size).
     vectors: Vec<Vec<f32>>,
-    /// Number of rows in this batch
+
+    /// Number of rows in this batch.
+    /// This must match vectors.len()
     row_count: usize,
-    /// Size of each vector
+
+    /// Size of each vector (number of elements per row).
+    /// This must match the length of each inner vector in vectors.
+    /// For one-hot encoding, this equals the vocabulary size.
+    /// For token encoding, this equals max_seq_length.
     vector_size: usize,
 }
 
 /// Configuration for text processing
+/// Configuration settings for processing text data into GPU-compatible format
+/// 
+/// This struct defines how text data should be processed, including batch sizes,
+/// CSV formatting details, and vocabulary constraints. It is used to control
+/// how text data is converted into numerical vectors suitable for GPU processing.
+/// 
+/// # Example
+/// ```
+/// let config = TextProcessingConfig {
+///     batch_size: 1000,
+///     has_header: true,
+///     columns_to_process: vec![0, 1],  // Process first two columns
+///     max_vocab_size: 10000,
+/// };
+/// ```
+/// 
+/// # Notes
+/// - Batch size should be chosen based on available GPU memory and processing requirements
+/// - Max vocabulary size limits memory usage but may cause rare terms to be ignored
+/// - Column indices are 0-based
 #[derive(Debug)]
 struct TextProcessingConfig {
-    /// Maximum number of rows to process in one batch
-    batch_size: usize,
-    /// Whether to include header row
-    has_header: bool,
-    /// Which columns to process (0-based indices)
-    columns_to_process: Vec<usize>,
-    /// Maximum vocabulary size for each column
-    max_vocab_size: usize,
+    /// Number of rows to process in each batch
+    /// 
+    /// This controls the memory usage and processing granularity.
+    /// Larger batches may be more efficient but require more memory.
+    /// Should be tuned based on:
+    /// - Available system memory
+    /// - GPU memory capacity
+    /// - Processing time requirements
+    pub batch_size: usize,
+
+    /// Indicates whether the input file has a header row
+    /// 
+    /// If true, the first row of the file will be skipped during processing
+    /// as it is assumed to contain column names rather than data.
+    pub has_header: bool,
+
+    /// Indices of columns to process from the input file
+    /// 
+    /// Zero-based indices of columns that should be processed.
+    /// Other columns will be ignored.
+    /// 
+    /// # Example
+    /// - vec![0, 2] will process the first and third columns
+    /// - Empty vec![] will result in no processing
+    /// 
+    /// # Panics
+    /// Will panic if any index is out of bounds for the input file
+    pub columns_to_process: Vec<usize>,
+
+    /// Maximum number of unique terms to include in vocabulary
+    /// 
+    /// Limits the size of the vocabulary to control memory usage
+    /// and vector dimensionality. Terms beyond this limit will
+    /// be ignored (effectively treated as out-of-vocabulary).
+    /// 
+    /// # Notes
+    /// - Affects memory usage and processing time
+    /// - Should be set based on dataset characteristics
+    /// - Too small: may lose important information
+    /// - Too large: may include noise and increase memory usage
+    pub max_vocab_size: usize,
 }
 
 /// Processes CSV files in batches for GPU computation
+/// Processes large CSV files in batches, preparing text data for GPU computation.
+/// This processor is designed to:
+/// 1. Handle large files that don't fit in memory
+/// 2. Convert text data into numerical formats suitable for GPU processing
+/// 3. Maintain consistent vocabularies across batches
+/// 4. Process multiple columns independently
+///
+/// # Example usage:
+/// ```
+/// let config = TextProcessingConfig {
+///     batch_size: 1000,
+///     has_header: true,
+///     columns_to_process: vec![0, 1],
+///     max_vocab_size: 10000,
+/// };
+///
+/// let mut processor = CSVBatchProcessor::new(
+///     PathBuf::from("data/large_file.csv"),
+///     config,
+/// )?;
+///
+/// processor.build_vocabularies()?;
+/// while let Some(batch) = processor.process_next_batch()? {
+///     // Process batch.vectors on GPU
+/// }
+/// ```
 struct CSVBatchProcessor {
-    /// Path to the CSV file
+    /// Path to the CSV file being processed
     file_path: PathBuf,
-    /// Processing configuration
+
+    /// Processing configuration parameters
     config: TextProcessingConfig,
-    /// Vocabulary maps for each column
+
+    /// Vocabulary mappings for each processed column.
+    /// Index in vector corresponds to index in columns_to_process.
+    /// Each HashMap maps terms to their numerical indices.
     column_vocabularies: Vec<HashMap<String, usize>>,
-    /// Current position in file
+
+    /// Current byte position in the input file.
+    /// Used to track progress and enable batch processing.
     current_position: u64,
 }
 
 impl CSVBatchProcessor {
     /// Creates a new CSV processor with specified configuration
+    /// Creates a new CSV processor with specified configuration.
+    /// 
+    /// # Arguments
+    /// * `file_path` - Path to the CSV file to process
+    /// * `config` - Configuration parameters for processing
+    /// 
+    /// # Returns
+    /// * `Ok(CSVBatchProcessor)` if file exists and configuration is valid
+    /// * `Err` if file doesn't exist or other IO error occurs
+    /// 
+    /// # Examples
+    /// ```
+    /// let config = TextProcessingConfig {
+    ///     batch_size: 1000,
+    ///     has_header: true,
+    ///     columns_to_process: vec![0, 1],
+    ///     max_vocab_size: 10000,
+    /// };
+    /// 
+    /// let processor = CSVBatchProcessor::new(
+    ///     PathBuf::from("data/example.csv"),
+    ///     config,
+    /// )?;
+    /// ```
     fn new(
         file_path: PathBuf,
         config: TextProcessingConfig,
@@ -138,6 +256,33 @@ impl CSVBatchProcessor {
             current_position: 0,
         })
     }
+    
+    
+    /// Builds vocabularies by scanning through the CSV file and creating mappings
+    /// of unique terms to numeric indices for each processed column.
+    /// 
+    /// # Process
+    /// 1. Reads the CSV file line by line
+    /// 2. For each specified column, maintains a vocabulary of unique terms
+    /// 3. Maps each unique term to a numeric index (0 to vocabulary_size - 1)
+    /// 4. Respects max_vocab_size limit from configuration
+    /// 
+    /// # Arguments
+    /// * `&mut self` - Mutable reference to modify internal vocabulary mappings
+    /// 
+    /// # Returns
+    /// * `io::Result<()>` - Ok(()) if successful, Err if file operations fail
+    /// 
+    /// # Errors
+    /// - Returns io::Error if file cannot be opened
+    /// - Returns io::Error if file reading fails
+    /// - Returns io::Error if line parsing fails
+    /// 
+    /// # Notes
+    /// - Skips header row if config.has_header is true
+    /// - Stops adding new terms to a column's vocabulary once max_vocab_size is reached
+    /// - Terms encountered after max_vocab_size is reached will be ignored
+    /// - Column indices that exceed the number of fields in a row are skipped
     /// Builds vocabulary from the first pass through the file
     fn build_vocabularies(&mut self) -> io::Result<()> {
         let file = File::open(&self.file_path)?;
@@ -208,7 +353,19 @@ impl CSVBatchProcessor {
     //     Ok(())
     // }
 
-    /// Processes the next batch of rows
+    
+    
+    /// Processes the next batch of rows from the input file.
+    /// 
+    /// # Returns
+    /// * `Ok(Some(TextBatch))` if a batch was successfully read and processed
+    /// * `Ok(None)` if end of file was reached
+    /// * `Err` if IO error occurs during reading
+    /// 
+    /// # Notes
+    /// * Batch size may be smaller than configured batch_size at end of file
+    /// * Vectorization uses vocabularies built during build_vocabularies()
+    /// * Each row is converted to fixed-size numerical vectors
     fn process_next_batch(&mut self) -> io::Result<Option<TextBatch>> {
         let file = File::open(&self.file_path)?;
         let mut reader = BufReader::new(file);
